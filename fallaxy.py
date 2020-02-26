@@ -659,6 +659,7 @@ def api():
 
 
 @app.route('/api/custom/collections/<filename>')
+@app.route('/api/automation-hub/custom/collections/<filename>')
 @login_optional
 def get_collection_download_redirect(filename):
     # Both Galaxy and AH redirect the URL to S3 which rejects the request if Authorization is set. This replicates that
@@ -667,6 +668,7 @@ def get_collection_download_redirect(filename):
 
 
 @app.route('/api/custom/collections-download/<filename>')
+@app.route('/api/automation-hub/custom/collections-download/<filename>')
 @login_reject
 def get_collection_download(filename):
     file_path = os.path.join(COLLECTIONS_DIR, filename)
