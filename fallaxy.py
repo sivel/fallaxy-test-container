@@ -710,6 +710,17 @@ def collections_get(api_version):
 @app.route('/api/automation-hub/<api_version>/artifacts/collections/', methods=['POST'])
 @login_required
 def collections_post(api_version):
+    content_length = request.headers.get('Content-Length')
+    content_type_header = request.headers.get('Content-Type')
+
+    if not content_length or not content_type_header:
+        return json_galaxy_error(api_version, 'invalid', 'Invalid input.')
+
+    content_type, boundary = content_type_header.split(';')
+    if content_type != 'multipart/form-data':
+        return json_galaxy_error(api_version, 'unsupported media type',
+                                 'Unsupported medial type "%s" in request.' % content_type_header, status=415)
+
     file = request.files.get('file')
     expected_hash = request.form.get('sha256')
 
@@ -723,14 +734,14 @@ def collections_post(api_version):
     sha256 = hashlib.sha256()
     import_path = os.path.join(IMPORT_TMP, secure_filename(file.filename))
     b_collection_tar = file.stream.read()
+    sha256.update(b_collection_tar)
+    actual_hash = sha256.hexdigest()
+
+    if actual_hash != expected_hash:
+        return json_galaxy_error(api_version, 'invalid', 'The expected hash did not match the actual hash.',
+                                 'Invalid input.')
+
     with open(import_path, mode='wb') as import_fd:
-        sha256.update(b_collection_tar)
-        actual_hash = sha256.hexdigest()
-
-        if actual_hash != expected_hash:
-            return json_galaxy_error(api_version, 'invalid', 'The expected hash did not match the actual hash.',
-                                     'Invalid input.')
-
         import_fd.write(b_collection_tar)
 
     # Galaxy does a basic check to ensure the collection doesn't already exist before starting the async import.
