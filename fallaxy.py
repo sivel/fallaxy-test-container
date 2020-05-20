@@ -7,9 +7,7 @@
 from __future__ import (absolute_import, division, print_function)
 __metaclass__ = type
 
-import configparser
 import datetime
-import errno
 import hashlib
 import json
 import os
@@ -36,8 +34,12 @@ from functools import (
     wraps,
 )
 
+from werkzeug.utils import (
+    secure_filename,
+)
+
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:?check_same_thread=False'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
@@ -46,9 +48,6 @@ IMPORT_TMP = os.path.join(os.path.dirname(__file__), 'tmp-import')
 AUTH_TOKEN = os.environ.get('FALLAXY_TOKEN', None)
 PAGINATION_COUNT = int(os.environ.get('FALLAXY_PAGINATION_COUNT', 5))
 
-# THIS IS A BAD HACK! No idea why buy querying and updating the ImportTask table in another thread puts the database
-# in a bad state. Instead just keep track of the imports in a simple dictionary
-IMPORT_LOCK = threading.Lock()
 IMPORT_TABLE = {}
 
 
@@ -530,24 +529,6 @@ def login_required(f):
     return decorated
 
 
-def process_form_data(value):
-    value = value.strip()
-    disposition_index = value.find(b';')
-    content_disposition = value[:disposition_index].split(b':')[-1].strip().decode('utf-8')
-    form_data = value[disposition_index + 1:].strip()
-
-    disposition_params = re.split(b'[\r\n]+', form_data, 1)
-
-    headers = {}
-    for b_header in disposition_params[0].split(b';'):
-        header_split = b_header.decode('utf-8').split('=', 2)
-        headers[header_split[0].strip()] = header_split[1].strip('"')
-
-    ext_value = disposition_params[1]
-
-    return content_disposition, headers, ext_value
-
-
 def process_import(import_task, collection_path):
     """ Very basic collection validation. """
     import_task.messages.append({'level': 'INFO', 'message': 'Starting import: task_id=%s' % import_task.id,
@@ -729,9 +710,6 @@ def collections_get(api_version):
 @app.route('/api/automation-hub/<api_version>/artifacts/collections/', methods=['POST'])
 @login_required
 def collections_post(api_version):
-    # Flask does not seem to parse the form data properly, will need to do it manually.
-    post_data = request.get_data()
-
     content_length = request.headers.get('Content-Length')
     content_type_header = request.headers.get('Content-Type')
 
@@ -743,37 +721,27 @@ def collections_post(api_version):
         return json_galaxy_error(api_version, 'unsupported media type',
                                  'Unsupported medial type "%s" in request.' % content_type_header, status=415)
 
-    boundary = re.findall(r'boundary=([\x00-\x7f]*)', boundary)[0]  # Boundary can take in any 7-bit ASCII chars.
-    if not boundary:
-        return json_galaxy_error(api_version, 'parse_error',
-                                 'Multipart form parse error - Invalid boundary in multipart: ')
+    file = request.files.get('file')
+    expected_hash = request.form.get('sha256')
 
-    # The boundary start and end is defined by 2 hyphen, ignore that when splitting the form data.
-    form_data = [process_form_data(v) for v in post_data.split(b'--' + boundary.encode('ascii')) if v and v != b'--']
-
-    # Verify the expected hash is there
-    if form_data[0][0] != 'form-data' or 'name' not in form_data[0][1] or form_data[0][1]['name'] != 'sha256':
+    if not expected_hash:
         return json_galaxy_error(api_version, 'parse_error',
                                  'Multipart form parse error - Missing form-data with sha256 hash')
-    expected_hash = form_data[0][2].decode('ascii')
 
-    # Verify the file data is there
-    if form_data[1][0] != 'file' or 'filename' not in form_data[1][1]:
+    if not file:
         return json_galaxy_error(api_version, 'parse_error', 'Multipart form parse error - Missing file with filename')
-    filename = form_data[1][1]['filename']
 
-    # The actual collection bytes is preset after the first 2 newlines, read that and place it into a temporary file.
-    b_collection_tar = form_data[1][2].split(b'\r\n', 2)[2]
     sha256 = hashlib.sha256()
-    import_path = os.path.join(IMPORT_TMP, filename)
+    import_path = os.path.join(IMPORT_TMP, secure_filename(file.filename))
+    b_collection_tar = file.stream.read()
+    sha256.update(b_collection_tar)
+    actual_hash = sha256.hexdigest()
+
+    if actual_hash != expected_hash:
+        return json_galaxy_error(api_version, 'invalid', 'The expected hash did not match the actual hash.',
+                                 'Invalid input.')
+
     with open(import_path, mode='wb') as import_fd:
-        sha256.update(b_collection_tar)
-        actual_hash = sha256.hexdigest()
-
-        if actual_hash != expected_hash:
-            return json_galaxy_error(api_version, 'invalid', 'The expected hash did not match the actual hash.',
-                                     'Invalid input.')
-
         import_fd.write(b_collection_tar)
 
     # Galaxy does a basic check to ensure the collection doesn't already exist before starting the async import.
@@ -804,16 +772,15 @@ def collections_post(api_version):
             os.remove(import_path)
             return json_galaxy_error(api_version, 'conflict.artifact_exists', 'Artifact already exists.', status=409)
 
-    with IMPORT_LOCK:
-        if api_version == 'v2':
-            import_id = len(IMPORT_TABLE)
-            import_uri = '%sapi/v2/collection-imports/%s/' % (request.host_url, import_id)
-        else:
-            import_id = str(uuid.uuid4())
-            import_uri = '/api/automation-hub/v3/imports/collections/%s/' % import_id
+    if api_version == 'v2':
+        import_id = len(IMPORT_TABLE)
+        import_uri = '%sapi/v2/collection-imports/%s/' % (request.host_url, import_id)
+    else:
+        import_id = str(uuid.uuid4())
+        import_uri = '/api/automation-hub/v3/imports/collections/%s/' % import_id
 
-        import_task = ImportTask(import_id)
-        IMPORT_TABLE[str(import_id)] = import_task
+    import_task = ImportTask(import_id)
+    IMPORT_TABLE[str(import_id)] = import_task
 
     import_thread = threading.Thread(target=process_import, args=(import_task, import_path))
     import_thread.daemon = True
@@ -864,7 +831,7 @@ def main():
 
     start_up()
 
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    app.run(host='0.0.0.0', port=8080, debug=False, threaded=False)
 
 
 if __name__ == '__main__':
