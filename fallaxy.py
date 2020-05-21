@@ -344,10 +344,12 @@ def get_tar_hash(tar, name):
 def insert_collection(manifest, filename, collection_size, collection_hash):
     if not Namespace.query.filter_by(name=manifest['namespace']).first():
         db.session.add(Namespace(name=manifest['namespace']))
+        db.session.commit()
     namespace = Namespace.query.filter_by(name=manifest['namespace']).first()
 
     if not Collection.query.with_parent(namespace).filter_by(name=manifest['name']).first():
         db.session.add(Collection(name=manifest['name'], namespace=namespace))
+        db.session.commit()
     collection = Collection.query.with_parent(namespace).filter_by(name=manifest['name']).first()
 
     version_kwargs = {}
